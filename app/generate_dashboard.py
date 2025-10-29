@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import os
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 # --- Page Setup ---
 st.set_page_config(page_title="📚 ArXiv Paper Summaries", layout="wide")

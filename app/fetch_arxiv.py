@@ -1,6 +1,8 @@
 import feedparser
 import pandas as pd
 import os
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 # --- Categories to fetch ---
 CATEGORIES = [

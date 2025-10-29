@@ -2,6 +2,8 @@
 
 import pandas as pd
 import os
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 # --- Load and clean data ---
 df = pd.read_csv("data/processed/summarized.csv")

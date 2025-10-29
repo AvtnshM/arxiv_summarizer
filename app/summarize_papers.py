@@ -4,6 +4,8 @@ import os
 import pandas as pd
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 
 # --- Load environment variables ---
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
