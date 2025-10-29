@@ -3,15 +3,18 @@ name: Run ArXiv Summarizer and Update Dashboard
 on:
   push:
     branches:
-      - master
+      - main
   schedule:
-    # 🇮🇳 Run twice a week at 6:00 AM IST (00:30 UTC = 6:00 IST)
+    # 🇮🇳 Twice a week at 6:00 AM IST (which is 00:30 UTC)
     - cron: "30 0 * * 1,4"
-  workflow_dispatch:  # manual trigger option
+  workflow_dispatch:  # allows manual trigger from GitHub Actions tab
+
+permissions:
+  contents: write  # ✅ gives workflow permission to push changes
 
 jobs:
   run_pipeline:
-    runs-on: windows-latest   # ✅ matches your local environment
+    runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
@@ -19,7 +22,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2️⃣ Setup Python
+      # 2️⃣ Set up Python environment
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -36,15 +39,16 @@ jobs:
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          python app/fetch_papers.py
+          python app/fetch_arxiv.py
           python app/summarize_papers.py
           python app/generate_dashboard.py
+          python app/newsletter_generator.py
 
-      # 5️⃣ Commit and push new data
-      - name: Commit and push results
+      # 5️⃣ Commit and push updates to repo
+      - name: Commit and push updated data
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions@users.noreply.github.com"
-          git add data/processed/summarized.csv output/summaries.json || echo "Nothing to commit"
-          git commit -m "Auto update summaries" || echo "No changes to commit"
-          git push origin master || echo "No push required"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/processed/summarized.csv output/newsletter.html || echo "Nothing to add"
+          git commit -m "🤖 Auto-update: Summaries, Newsletter, and Dashboard refreshed" || echo "No changes to commit"
+          git push origin main || echo "No push required"
