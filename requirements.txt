@@ -69,3 +69,5 @@ urllib3==2.5.0
 watchdog==6.0.0
 yagmail==0.15.293
 groq
+reportlab>=4.0
+weasyprint>=58.0

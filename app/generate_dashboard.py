@@ -2,141 +2,215 @@ import streamlit as st
 import pandas as pd
 import os
 import sys
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+import subprocess
+import requests
+import time
 sys.stdout.reconfigure(encoding='utf-8')
 
-# --- Page Setup ---
+# LLM client
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+
 st.set_page_config(page_title="📚 ArXiv Paper Summaries", layout="wide")
 st.title("🧠 ArXiv Paper Summaries Dashboard")
 
-# --- Load Data ---
+CSV_PATH = "data/processed/summarized.csv"
+RAW_PATH = "data/raw/papers.csv"
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+def human_ts(iso_ts):
+    try:
+        return pd.to_datetime(iso_ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return iso_ts
+
+def week_of_iso(iso_ts):
+    try:
+        dt = pd.to_datetime(iso_ts)
+        monday = dt - pd.Timedelta(days=dt.dayofweek)
+        return f"Week of {monday.date().isoformat()}"
+    except Exception:
+        return ""
+
 @st.cache_data
-def load_data():
-    """
-    Load and prepare the summarized papers data.
-    
-    CHANGES MADE:
-    1. Use 'summary' column explicitly (contains full paper summaries)
-    2. Handle multiline text and special characters properly
-    3. Strip any intro text like "Here's a summary..."
-    4. Ensure empty summaries show placeholder text
-    
-    Returns:
-        pd.DataFrame: Cleaned dataframe with summary_text column
-    """
-    csv_path = "data/processed/summarized.csv"
-    if not os.path.exists(csv_path):
-        st.error("❌ summarized.csv not found! Please run summarizer first.")
-        st.stop()
-
-    df = pd.read_csv(csv_path)
-
-    # Normalize column names
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    # FIXED: Use the 'summary' column directly - it has the full summary text
-    if "summary" in df.columns:
-        df["summary_text"] = df["summary"].fillna("").astype(str)
-    elif "summary_short" in df.columns:
-        df["summary_text"] = df["summary_short"].fillna("").astype(str)
+def load_processed():
+    if os.path.exists(CSV_PATH):
+        df = pd.read_csv(CSV_PATH)
     else:
-        df["summary_text"] = ""
-
-    # Clean summaries — remove prefix like "Here's a summary..." and extra whitespace
-    df["summary_text"] = (
-        df["summary_text"]
-        .str.replace(r"(?i)^here.?s a summary.*?:\s*", "", regex=True)
-        .str.replace(r"\n+", " ", regex=True)  # Replace newlines with spaces
-        .str.replace(r"\s+", " ", regex=True)  # Replace multiple spaces with single space
-        .str.strip()
-    )
-
-    # Clean key columns
-    for col in ["title", "authors", "category", "link"]:
-        if col in df.columns:
-            df[col] = df[col].fillna("").astype(str)
-
+        df = pd.DataFrame()
+    # Normalize
+    if not df.empty:
+        df.columns = [c.strip() for c in df.columns]
+        if "summary" not in df.columns and "summary_short" in df.columns:
+            df["summary"] = df["summary_short"]
+        for c in ["title","authors","category","link","summary","summary_updated","week_of_update"]:
+            if c not in df.columns:
+                df[c] = ""
     return df
 
+@st.cache_data
+def load_raw():
+    if os.path.exists(RAW_PATH):
+        return pd.read_csv(RAW_PATH)
+    return pd.DataFrame()
 
-df = load_data()
+proc = load_processed()
+raw = load_raw()
 
-# --- Debug info (comment out after fixing) ---
-# st.write("DEBUG - Available columns:", df.columns.tolist())
-# st.write("DEBUG - First summary:", df["summary_text"].iloc[0][:200] if len(df) > 0 else "No data")
+# Sidebar
+st.sidebar.header("Controls")
+st.sidebar.markdown("Use LLM to generate missing summaries (costs tokens). Prefer bulk GH Action runs for full corpus.")
 
-# --- Filters ---
-categories = sorted(df["category"].dropna().unique())
-selected_category = st.selectbox("📂 Select Category", ["All"] + categories)
-search_term = st.text_input("🔍 Search by Title or Author")
-
-filtered_df = df.copy()
-
-if selected_category != "All":
-    filtered_df = filtered_df[filtered_df["category"] == selected_category]
-
-if search_term:
-    filtered_df = filtered_df[
-        filtered_df["title"].str.contains(search_term, case=False, na=False)
-        | filtered_df["authors"].str.contains(search_term, case=False, na=False)
-    ]
-
-st.markdown(f"### Showing {len(filtered_df)} papers")
-
-# --- Dynamic layout width based on summary length ---
-def get_card_width(summary):
-    """
-    Calculate card width based on summary length for better readability.
-    
-    Args:
-        summary (str): The summary text
-        
-    Returns:
-        str: CSS width value (e.g., "70%")
-    """
-    length = len(summary)
-    if length < 400:
-        return "70%"
-    elif length < 800:
-        return "85%"
+# Refresh GH Action workflow
+st.sidebar.subheader("Pipeline / Refresh")
+if st.sidebar.button("🔁 Dispatch pipeline (GitHub Actions)"):
+    GH_PAT = os.getenv("GH_PAT")
+    REPO_OWNER = os.getenv("REPO_OWNER")
+    REPO_NAME = os.getenv("REPO_NAME")
+    WORKFLOW_FILE = os.getenv("WORKFLOW_FILE", "run_pipeline.yml")
+    REF = os.getenv("WORKFLOW_REF", "main")
+    if not (GH_PAT and REPO_OWNER and REPO_NAME):
+        st.sidebar.error("Set GH_PAT, REPO_OWNER, REPO_NAME in env (.env).")
     else:
-        return "95%"
+        url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/{WORKFLOW_FILE}/dispatches"
+        headers = {"Accept":"application/vnd.github+json","Authorization":f"token {GH_PAT}"}
+        payload = {"ref": REF}
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=30)
+            if r.status_code in (204,201):
+                st.sidebar.success("Dispatch accepted. Check Actions tab for run.")
+            else:
+                st.sidebar.error(f"GitHub API returned {r.status_code}: {r.text}")
+        except Exception as e:
+            st.sidebar.error(f"Dispatch failed: {e}")
 
-# --- Display Papers ---
-for _, row in filtered_df.iterrows():
-    summary_text = row.get("summary_text", "").strip()
-    
-    # FIXED: Better check for empty summaries
-    if not summary_text or len(summary_text) < 10:
-        summary_text = "<i>No summary available.</i>"
+st.sidebar.markdown("---")
+if st.sidebar.button("📄 Generate newsletter PDF (server)"):
+    try:
+        # run newsletter generator script on server (assumes Python is available)
+        subprocess.check_call([sys.executable, "app/newsletter_generator.py"])
+        st.sidebar.success("Newsletter (PDF) regenerated at output/newsletter.pdf")
+    except Exception as e:
+        st.sidebar.error(f"Failed to generate PDF: {e}")
 
-    card_width = get_card_width(summary_text)
+st.sidebar.markdown("---")
+st.sidebar.markdown("Env loaded from .env. Ensure GROQ_API_KEY set for LLM.")
 
-    st.markdown(
-        f"""
-        <div style="
-            background-color:#ffffff;
-            padding:16px 22px;
-            border-radius:12px;
-            margin-bottom:15px;
-            box-shadow:0 3px 8px rgba(0,0,0,0.08);
-            border-left:6px solid #1a73e8;
-            width:{card_width};
-            transition: all 0.2s ease-in-out;
-        ">
-            <h4 style="color:#1a73e8;margin-bottom:10px;">{row['title']}</h4>
-            <p style="font-size:15px;line-height:1.55;color:#333;text-align:justify;
-                      margin-bottom:8px;">
-                {summary_text}
-            </p>
-            <p style="font-size:14px;color:#555;margin-top:4px;">
-                <b>Authors:</b> {row['authors']}<br>
-                <b>Category:</b> {row['category']}
-            </p>
-            <a href="{row['link']}" target="_blank" 
-               style="color:#0b66c2;font-weight:bold;text-decoration:none;">
-               🔗 Read full paper
-            </a>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# Main area
+st.markdown(f"**Total processed papers:** {len(proc)}")
+# Filter UI
+categories = ["All"] + sorted(proc["category"].dropna().unique().tolist())
+selected_category = st.selectbox("📂 Select Category", categories)
+search = st.text_input("🔍 Search by title or author")
+
+df_view = proc.copy()
+if selected_category != "All":
+    df_view = df_view[df_view["category"] == selected_category]
+if search:
+    df_view = df_view[df_view["title"].str.contains(search, case=False, na=False) | df_view["authors"].str.contains(search, case=False, na=False)]
+
+# show date of dataset generation (use latest summary_updated)
+if not proc.empty and proc["summary_updated"].astype(bool).any():
+    latest_ts = proc.loc[proc["summary_updated"].astype(bool), "summary_updated"].max()
+    st.caption(f"Data last updated (latest summary_generated): {human_ts(latest_ts)} UTC")
+else:
+    st.caption("No summary_generated timestamps found yet.")
+
+# Table display
+if df_view.empty:
+    st.info("No processed summaries found (or filtered out). You can generate summaries with the buttons below.")
+else:
+    df_view_display = df_view[["title","authors","category","summary","summary_updated","week_of_update","link"]].copy()
+    df_view_display["summary_updated"] = df_view_display["summary_updated"].apply(human_ts)
+    st.dataframe(df_view_display.rename(columns={"summary":"LLM_summary","summary_updated":"summary_generated_at","week_of_update":"week_of_update"}), height=350)
+
+st.markdown("---")
+st.subheader("Papers (detail)")
+
+# If no processed items, present raw entries with per-row generate button
+if proc.empty and not raw.empty:
+    st.warning("No processed summaries. Generate per paper or run the summarizer.")
+    sample = raw.head(50)
+    for idx, r in sample.iterrows():
+        st.write(f"**{r['title']}**")
+        cols = st.columns([5,1])
+        if cols[1].button("Generate summary", key=f"gen_raw_{idx}"):
+            # call LLM to generate, then append to processed csv
+            if not GROQ_API_KEY:
+                st.error("GROQ_API_KEY not set in env.")
+            else:
+                try:
+                    client = Groq(api_key=GROQ_API_KEY)
+                    prompt = f"Summarize this research paper for a general audience.\n\nTitle: {r['title']}\n\nAbstract: {r.get('abstract','')}\n\nSummary:"
+                    resp = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[{"role":"system","content":"You are a concise summarizer."},{"role":"user","content":prompt}],
+                        temperature=0.3,
+                        max_tokens=800
+                    )
+                    summary = resp.choices[0].message.content.strip()
+                except Exception as e:
+                    summary = f"ERROR: {e}"
+                ts = now_iso()
+                wk = week_of_iso(ts)
+                new_row = r.to_dict()
+                new_row.update({"summary": summary, "summary_updated": ts, "week_of_update": wk})
+                # append to CSV
+                if os.path.exists(CSV_PATH):
+                    df_proc = pd.read_csv(CSV_PATH)
+                    df_proc = pd.concat([df_proc, pd.DataFrame([new_row])], ignore_index=True, sort=False)
+                else:
+                    df_proc = pd.DataFrame([new_row])
+                df_proc.to_csv(CSV_PATH, index=False)
+                st.experimental_rerun()
+
+# If processed present, let user select and regenerate
+if not proc.empty:
+    sel_title = st.selectbox("Select paper to view / regenerate", options=proc["title"].tolist())
+    row = proc[proc["title"] == sel_title].iloc[0]
+    st.markdown(f"### {row['title']}")
+    st.markdown(f"**Authors:** {row.get('authors','-')}  —  **Category:** {row.get('category','-')}")
+    st.markdown(f"**Summary generated at:** {human_ts(row.get('summary_updated',''))} UTC")
+    st.markdown(f"**Week:** {row.get('week_of_update','')}")
+    st.markdown("#### LLM Summary")
+    st.write(row.get("summary","*No summary stored.*"))
+
+    if st.button("Regenerate summary (LLM)"):
+        if not GROQ_API_KEY:
+            st.error("GROQ_API_KEY not set.")
+        else:
+            with st.spinner("Calling LLM to regenerate summary..."):
+                try:
+                    client = Groq(api_key=GROQ_API_KEY)
+                    prompt = f"Summarize this research paper for a general audience.\n\nTitle: {row['title']}\n\nAbstract: {row.get('abstract','')}\n\nSummary:"
+                    resp = client.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=[{"role":"system","content":"You are a concise summarizer."},{"role":"user","content":prompt}],
+                        temperature=0.3,
+                        max_tokens=800
+                    )
+                    summary = resp.choices[0].message.content.strip()
+                except Exception as e:
+                    summary = f"ERROR: {e}"
+                ts = now_iso()
+                wk = week_of_iso(ts)
+                # update CSV on disk
+                df_proc = pd.read_csv(CSV_PATH)
+                mask = df_proc["title"] == row["title"]
+                df_proc.loc[mask, "summary"] = summary
+                df_proc.loc[mask, "summary_updated"] = ts
+                df_proc.loc[mask, "week_of_update"] = wk
+                df_proc.to_csv(CSV_PATH, index=False)
+                st.success("Regenerated summary and saved to CSV.")
+                st.experimental_rerun()

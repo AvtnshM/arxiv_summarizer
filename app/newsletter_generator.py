@@ -1,166 +1,90 @@
-# app/newsletter_generator.py
-
-import pandas as pd
+"""
+Generate PDF newsletter only (output/newsletter.pdf) from data/processed/summarized.csv.
+Uses WeasyPrint when available (preferred). Falls back to reportlab (text-only).
+"""
 import os
+import pandas as pd
+from datetime import datetime
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
-# --- Load and clean data ---
-df = pd.read_csv("data/processed/summarized.csv")
+CSV_PATH = "data/processed/summarized.csv"
+OUT_DIR = "output"
+PDF_PATH = os.path.join(OUT_DIR, "newsletter.pdf")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-df["summary_short"] = df["summary_short"].fillna("").astype(str).str.strip()
-df["summary_short"] = df["summary_short"].str.replace(
-    r"^Here’s a summary of the research paper for a general audience[:\-]*\s*", "",
-    regex=True
-)
-df["category"] = df["category"].fillna("Uncategorized")
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"{CSV_PATH} not found. Run summarizer first.")
 
-# --- Create output directory ---
-os.makedirs("output", exist_ok=True)
+df = pd.read_csv(CSV_PATH)
+# prefer full summary column, else summary_short
+df["summary"] = df.get("summary", df.get("summary_short", "")).fillna("").astype(str)
+df["summary_updated"] = df.get("summary_updated", "").fillna("")
+df["week_of_update"] = df.get("week_of_update", "").fillna("")
 
-# --- Build HTML ---
-categories = sorted(df["category"].unique().tolist())
+newsletter_week = df["week_of_update"].mode().iloc[0] if not df.empty else f"Week of {datetime.utcnow().date().isoformat()}"
 
-html_content = f"""
-<html>
-<head>
-    <title>AI Research Newspaper</title>
-    <style>
-        body {{
-            font-family: 'Georgia', serif;
-            background-color: #f7f7f7;
-            color: #222;
-            margin: 0;
-            padding: 0;
-        }}
-        header {{
-            background-color: #1a73e8;
-            color: white;
-            text-align: center;
-            padding: 45px 25px;
-            font-size: 2.3em;
-            font-weight: bold;
-            letter-spacing: 0.5px;
-        }}
-        .container {{
-            width: 85%;
-            margin: 30px auto;
-            max-width: 1200px;
-        }}
-        .filter {{
-            text-align: center;
-            margin-bottom: 25px;
-        }}
-        select {{
-            font-size: 16px;
-            padding: 8px 14px;
-            border-radius: 8px;
-            border: 1px solid #aaa;
-        }}
-        .grid {{
-            column-count: 2;
-            column-gap: 40px;
-        }}
-        .paper {{
-            background-color: #fff;
-            display: inline-block;
-            margin: 0 0 25px;
-            width: 100%;
-            border-radius: 10px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-            padding: 20px;
-            border-left: 6px solid #1a73e8;
-        }}
-        .paper h2 {{
-            margin: 0 0 8px 0;
-            font-size: 1.3em;
-        }}
-        .paper h2 a {{
-            color: #1a5276;
-            text-decoration: none;
-        }}
-        .paper h2 a:hover {{
-            text-decoration: underline;
-        }}
-        .meta {{
-            font-size: 0.9em;
-            color: #666;
-            margin-bottom: 10px;
-        }}
-        .paper p {{
-            font-size: 0.95em;
-            text-align: justify;
-            line-height: 1.5;
-        }}
-        footer {{
-            text-align: center;
-            color: #555;
-            font-size: 0.9em;
-            padding: 20px 0;
-            margin-top: 40px;
-            border-top: 1px solid #ddd;
-        }}
-        @media (max-width: 800px) {{
-            .grid {{
-                column-count: 1;
-            }}
-        }}
-    </style>
-</head>
-<body>
-    <header>📰 AI Research Highlights – Weekly Edition</header>
-    <div class="container">
-        <div class="filter">
-            <label for="categorySelect"><b>Filter by Category:</b></label>
-            <select id="categorySelect" onchange="filterCategory()">
-                <option value="All">All</option>
-"""
+# build lightweight HTML in-memory (to feed to WeasyPrint)
+html = []
+html.append(f"<h1>ArXiv Paper Summaries — {newsletter_week}</h1>")
+html.append(f"<p>Generated: {datetime.utcnow().isoformat()} UTC</p>")
+html.append("<hr/>")
+for _, r in df.sort_values("published", ascending=False).iterrows():
+    html.append(f"<h2>{r['title']}</h2>")
+    html.append(f"<div><strong>Authors:</strong> {r.get('authors','-')}  &nbsp; <strong>Updated:</strong> {r.get('summary_updated','-')}</div>")
+    html.append(f"<p>{r['summary']}</p>")
+    html.append("<hr/>")
 
-# Dropdown options
-for cat in categories:
-    html_content += f'                <option value="{cat}">{cat}</option>\n'
+html_content = "<html><head><meta charset='utf-8'><style>body{font-family:Arial,Helvetica,sans-serif;padding:24px;}h1{font-size:22px;}h2{font-size:14px;}p{font-size:12px;line-height:1.45}</style></head><body>"
+html_content += "\n".join(html)
+html_content += "</body></html>"
 
-html_content += """            </select>
-        </div>
-        <div class="grid">
-"""
+# Try WeasyPrint
+try:
+    from weasyprint import HTML
+    HTML(string=html_content).write_pdf(PDF_PATH)
+    print(f"✅ PDF generated at {PDF_PATH} (WeasyPrint)")
+    sys.exit(0)
+except Exception as e:
+    print("⚠️ WeasyPrint not available or failed:", e)
+    print("Falling back to text-only PDF (reportlab)")
 
-# Paper blocks
-for _, row in df.iterrows():
-    html_content += f"""
-            <div class='paper' data-category='{row['category']}'>
-                <h2><a href='{row['link']}' target='_blank'>{row['title']}</a></h2>
-                <div class='meta'>{row['category']} | {row['authors']}</div>
-                <p>{row['summary_short']}</p>
-            </div>
-    """
-
-# Footer + JS
-html_content += """
-        </div>
-    </div>
-    <footer>Generated automatically by ArXiv Summarizer · © 2025</footer>
-
-    <script>
-        function filterCategory() {
-            const selected = document.getElementById('categorySelect').value;
-            const papers = document.getElementsByClassName('paper');
-            for (let i = 0; i < papers.length; i++) {
-                const category = papers[i].getAttribute('data-category');
-                if (selected === 'All' || category === selected) {
-                    papers[i].style.display = 'inline-block';
-                } else {
-                    papers[i].style.display = 'none';
-                }
-            }
-        }
-    </script>
-</body>
-</html>
-"""
-
-# --- Save output ---
-with open("output/newsletter.html", "w", encoding="utf-8") as f:
-    f.write(html_content)
-
-print("✅ Newsletter generated: output/newsletter.html (newspaper-style, interactive)")
+# Fallback: text-only PDF using reportlab
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    c = canvas.Canvas(PDF_PATH, pagesize=letter)
+    w, h = letter
+    y = h - 72
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(72, y, f"ArXiv Paper Summaries — {newsletter_week}")
+    y -= 18
+    c.setFont("Helvetica", 9)
+    c.drawString(72, y, f"Generated: {datetime.utcnow().isoformat()} UTC")
+    y -= 20
+    for _, r in df.iterrows():
+        title = r['title'][:150]
+        c.setFont("Helvetica-Bold", 11)
+        if y < 100:
+            c.showPage()
+            y = h - 72
+        c.drawString(72, y, title)
+        y -= 14
+        c.setFont("Helvetica", 9)
+        authors_line = f"Authors: {r.get('authors','-')} | Updated: {r.get('summary_updated','-')}"
+        c.drawString(72, y, authors_line[:1000])
+        y -= 12
+        # write summary wrapped in 110-char chunks
+        summary = r.get('summary', "")[:4000]
+        for i in range(0, len(summary), 110):
+            if y < 72:
+                c.showPage()
+                y = h - 72
+            c.drawString(80, y, summary[i:i+110])
+            y -= 12
+        y -= 12
+    c.save()
+    print(f"✅ Text-only PDF generated at {PDF_PATH} (reportlab fallback)")
+except Exception as ex:
+    print("❌ Fallback PDF generation failed:", ex)
+    raise
